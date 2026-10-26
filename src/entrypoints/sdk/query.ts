@@ -35,9 +35,9 @@ import {
   getSessionId,
   bindSdkContextToAsyncGenerator,
   runOutsideSdkContext,
-  registerHookCallbacks,
 } from '../../bootstrap/state.js'
-import type { HookCallbackMatcher, HookEvent } from '../../types/hooks.js'
+import type { HookCallback, HookCallbackMatcher } from '../../types/hooks.js'
+import type { HookEvent } from '../agentSdkTypes.js'
 import { isHookEvent } from '../../types/hooks.js'
 import type { SessionId } from '../../types/ids.js'
 import {
@@ -405,6 +405,7 @@ class QueryImpl implements Query {
   private permissionContext: ToolPermissionContext
   private timeoutQueue: SDKPermissionTimeoutMessage[] = []
   private agentFailureQueue: SDKAgentLoadFailureMessage[] = []
+  private hookCallbacks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {}
 
   constructor(
     engine: QueryEngine | null,
@@ -420,6 +421,7 @@ class QueryImpl implements Query {
     userAgents?: QueryOptions['agents'],
     mcpServers?: Record<string, unknown>,
     permissionContext: ToolPermissionContext = getEmptyToolPermissionContext(),
+    hooks?: QueryOptions['hooks'],
   ) {
     this._engineWasInjected = engine !== null
     if (engine) this._engine = engine
@@ -436,6 +438,28 @@ class QueryImpl implements Query {
     this.userAgents = userAgents
     this.mcpServers = mcpServers
     this.permissionContext = permissionContext
+    // Keep SDK callbacks on this query, never in the process-global registry.
+    for (const [event, matchers] of Object.entries(hooks ?? {})) {
+      if (!isHookEvent(event) || !Array.isArray(matchers)) continue
+      const callbackMatchers: HookCallbackMatcher[] = []
+      for (const matcher of matchers) {
+        if (!matcher || typeof matcher !== 'object' || !('hooks' in matcher)) continue
+        if (!Array.isArray(matcher.hooks)) continue
+        const callbacks = matcher.hooks.filter(
+          (hook): hook is (input: Parameters<HookCallback['callback']>[0]) => ReturnType<HookCallback['callback']> =>
+            typeof hook === 'function',
+        )
+        if (callbacks.length === 0) continue
+        callbackMatchers.push({
+          matcher: 'matcher' in matcher && typeof matcher.matcher === 'string' ? matcher.matcher : '',
+          hooks: callbacks.map(callback => ({
+            type: 'callback',
+            callback: async input => callback(input),
+          })),
+        })
+      }
+      if (callbackMatchers.length > 0) this.hookCallbacks[event] = callbackMatchers
+    }
   }
 
   /** The session ID for this query. Available immediately after query() returns. */
@@ -511,6 +535,7 @@ class QueryImpl implements Query {
       sessionProjectDir: null as string | null, // Resolved below after session resolution
       cwd: this.cwd,
       originalCwd: this.cwd,
+      registeredHooks: this.hookCallbacks,
     }
 
     const self = this
@@ -729,7 +754,11 @@ class QueryImpl implements Query {
       })(),
     )
 
-    yield* inner
+    try {
+      yield* inner
+    } finally {
+      this.clearHookCallbacks()
+    }
   }
 
   async setModel(model: string): Promise<void> {
@@ -761,7 +790,15 @@ class QueryImpl implements Query {
     this.engine.updateTools(updatedTools)
   }
 
+  private clearHookCallbacks(): void {
+    // Mutate the context's shared object so detached async work sees cleanup too.
+    for (const event of Object.keys(this.hookCallbacks)) {
+      delete this.hookCallbacks[event as HookEvent]
+    }
+  }
+
   close(): void {
+    this.clearHookCallbacks()
     const wrapperController = this.abortController
     this.interruptWithSource('sdk_close')
     requestSdkRootAbort(wrapperController, 'sdk_close', 'sdk_query')
@@ -1052,50 +1089,6 @@ export function query(params: {
     throw new Error('query() requires options.cwd')
   }
 
-  // Register SDK-provided hook callbacks with the in-process hook executor.
-  //
-  // The CLI path wires options.hooks through the control protocol
-  // (print.ts → structuredIO.createHookCallback → registerHookCallbacks);
-  // the in-process query() path historically dropped options.hooks on the
-  // floor — the field was declared but never consumed, so PreToolUse /
-  // PostToolUse / Stop callbacks silently never fired for SDK consumers.
-  //
-  // The kernel hook executor (utils/hooks.ts) reads STATE.registeredHooks on
-  // every hook event, so registering here makes in-process callbacks work
-  // exactly like their CLI counterparts. Each user callback receives the
-  // same HookInput the shell-hook and CLI-callback paths get; its return
-  // value (HookJSONOutput) drives allow/ask/deny decisions natively.
-  if (options.hooks) {
-    const registered: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {}
-    for (const [event, matchers] of Object.entries(options.hooks)) {
-      if (!isHookEvent(event) || !Array.isArray(matchers)) continue
-      const callbackMatchers: HookCallbackMatcher[] = []
-      for (const matcher of matchers) {
-        const m = matcher as {
-          matcher?: string
-          hooks?: unknown
-        }
-        if (!m || !Array.isArray(m.hooks)) continue
-        callbackMatchers.push({
-          matcher: m.matcher ?? '',
-          hooks: m.hooks
-            .filter((h): h is (input: unknown) => unknown => typeof h === 'function')
-            .map((h) => ({
-              type: 'callback' as const,
-              callback: async (input: unknown) =>
-                (await h(input)) as never,
-            })) as never,
-        })
-      }
-      if (callbackMatchers.length > 0) {
-        registered[event as HookEvent] = callbackMatchers
-      }
-    }
-    if (Object.keys(registered).length > 0) {
-      registerHookCallbacks(registered)
-    }
-  }
-
   // Note: We pass settings?.env to QueryImpl for application AFTER init() runs.
   // This ensures our env vars override config file env vars, not vice versa.
   // init() calls applyConfigEnvironmentVariables() which would override pre-applied env.
@@ -1167,7 +1160,7 @@ export function query(params: {
   // Also pass sessionId, fork/forkSession, continue, cwd, resumeSessionAt, and agents.
   const effectiveSessionId = options.sessionId || options.resume
   const shouldFork = options.fork || options.forkSession
-  const queryImpl = new QueryImpl(null, prompt, ac, appStateStore, envOverrides, effectiveSessionId, shouldFork, options.continue, cwd, options.resumeSessionAt, options.agents, options.mcpServers, permissionContext)
+  const queryImpl = new QueryImpl(null, prompt, ac, appStateStore, envOverrides, effectiveSessionId, shouldFork, options.continue, cwd, options.resumeSessionAt, options.agents, options.mcpServers, permissionContext, options.hooks)
 
   // Build the canUseTool that supports external permission resolution.
   // When no user canUseTool callback is provided, this creates a pending
