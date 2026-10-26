@@ -5,6 +5,7 @@ import { executePreToolHooks, executeStopHooks, getMatchingHooks } from '../../s
 import type { ToolUseContext } from '../../src/Tool.js'
 import { getDefaultAppState } from '../../src/state/AppStateStore.js'
 import type { HookInput } from '../../src/entrypoints/agentSdkTypes.js'
+import type { HookCallback } from '../../src/types/hooks.js'
 import { acquireSharedMutationLock, releaseSharedMutationLock } from '../../src/test/sharedMutationLock.js'
 import { MockQueryEngine } from './helpers/mock-engine.js'
 import { drainQuery } from './helpers/query-test-doubles.js'
@@ -108,6 +109,65 @@ test('query callbacks keep tool matchers and denial output through the hook exec
   await drainQuery(q)
   expect(seen).toHaveLength(1)
   expect(seen[0]!.session_id).toBe(q.sessionId)
+})
+
+test('malformed matchers are skipped while omitted and empty matchers remain wildcards', async () => {
+  const calls: string[] = []
+  const callback = (label: string) => async (input: HookInput) => {
+    if (input.hook_event_name === 'PreToolUse') calls.push(`${label}:${input.tool_name}`)
+    return {}
+  }
+  const q = createQuery({ PreToolUse: [
+    ...[42, null, false, {}, []].map(matcher => ({ matcher, hooks: [callback('invalid')] })),
+    { hooks: [callback('omitted')] },
+    { matcher: undefined, hooks: [callback('undefined')] },
+    { matcher: '', hooks: [callback('empty')] },
+    { matcher: '^Edit$', hooks: [callback('edit')] },
+  ] }, async () => {
+    const context = {
+      getAppState: getDefaultAppState,
+      options: { tools: [] },
+      abortController: new AbortController(),
+      updateAttributionState: () => {},
+    } as unknown as ToolUseContext
+    for (const name of ['Read', 'Edit']) {
+      for await (const _ of executePreToolHooks(name, `${name}-1`, {}, context)) {}
+    }
+  })
+  await drainQuery(q)
+  expect(calls.sort()).toEqual(['edit:Edit', 'empty:Edit', 'empty:Read', 'omitted:Edit', 'omitted:Read', 'undefined:Edit', 'undefined:Read'])
+})
+
+test('SDK callbacks receive executor arguments and the live combined abort signal', async () => {
+  const controller = new AbortController()
+  const appState = getDefaultAppState()
+  const getAppState = () => appState
+  const updateAttributionState = () => {}
+  let received: Parameters<HookCallback['callback']> | undefined
+  let observedAbort: boolean | undefined
+  const q = createQuery({ PreToolUse: [{ hooks: [async (...args: Parameters<HookCallback['callback']>) => {
+    received = args
+    controller.abort()
+    observedAbort = args[2]?.aborted
+    return {}
+  }] }] }, async () => {
+    const context = {
+      getAppState, updateAttributionState,
+      options: { tools: [] },
+      abortController: controller,
+    } as unknown as ToolUseContext
+    for await (const _ of executePreToolHooks('Edit', 'correlated-tool-1', {}, context, 'default', controller.signal)) {}
+  })
+  await drainQuery(q)
+  expect(received).toHaveLength(5)
+  expect(received![0].session_id).toBe(q.sessionId)
+  expect(received![1]).toBe('correlated-tool-1')
+  expect(received![2]).toBeInstanceOf(AbortSignal)
+  expect(observedAbort).toBe(true)
+  expect(received![3]).toBe(0)
+  expect(received![4]?.getAppState).toBe(getAppState)
+  expect(received![4]?.getAppState()).toBe(appState)
+  expect(received![4]?.updateAttributionState).toBe(updateAttributionState)
 })
 
 for (const ending of ['completed', 'failed', 'closed', 'returned'] as const) {

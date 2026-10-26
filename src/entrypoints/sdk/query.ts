@@ -445,16 +445,16 @@ class QueryImpl implements Query {
       for (const matcher of matchers) {
         if (!matcher || typeof matcher !== 'object' || !('hooks' in matcher)) continue
         if (!Array.isArray(matcher.hooks)) continue
+        if ('matcher' in matcher && matcher.matcher !== undefined && typeof matcher.matcher !== 'string') continue
         const callbacks = matcher.hooks.filter(
-          (hook): hook is (input: Parameters<HookCallback['callback']>[0]) => ReturnType<HookCallback['callback']> =>
-            typeof hook === 'function',
+          (hook): hook is HookCallback['callback'] => typeof hook === 'function',
         )
         if (callbacks.length === 0) continue
         callbackMatchers.push({
           matcher: 'matcher' in matcher && typeof matcher.matcher === 'string' ? matcher.matcher : '',
           hooks: callbacks.map(callback => ({
             type: 'callback',
-            callback: async input => callback(input),
+            callback: async (...args) => callback(...args),
           })),
         })
       }
