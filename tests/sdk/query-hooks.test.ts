@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test'
+import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { query, type QueryOptions } from '../../src/entrypoints/sdk/query.js'
 import { clearRegisteredHooks, registerHookCallbacks, getRegisteredHooks, getSessionId } from '../../src/bootstrap/state.js'
 import { executePreToolHooks, executeStopHooks, getMatchingHooks } from '../../src/utils/hooks.js'
@@ -7,14 +7,24 @@ import { getDefaultAppState } from '../../src/state/AppStateStore.js'
 import type { HookInput } from '../../src/entrypoints/agentSdkTypes.js'
 import type { HookCallback } from '../../src/types/hooks.js'
 import { acquireSharedMutationLock, releaseSharedMutationLock } from '../../src/test/sharedMutationLock.js'
+import * as settings from '../../src/utils/settings/settings.js'
+import * as hooksConfigSnapshot from '../../src/utils/hooks/hooksConfigSnapshot.js'
 import { MockQueryEngine } from './helpers/mock-engine.js'
 import { drainQuery } from './helpers/query-test-doubles.js'
 
 const queries: ReturnType<typeof query>[] = []
+const settingsSpies: Array<{ mockRestore(): void }> = []
 
 let savedHooks: ReturnType<typeof getRegisteredHooks>
 beforeEach(async () => {
   await acquireSharedMutationLock('sdk-query-hooks')
+  // The executor merges persisted hooks with registered callbacks. Isolate both
+  // fresh settings and an already captured snapshot without changing their caches.
+  settingsSpies.push(
+    spyOn(settings, 'getSettingsForSource').mockReturnValue(null),
+    spyOn(settings, 'getSettings_DEPRECATED').mockReturnValue({}),
+    spyOn(hooksConfigSnapshot, 'getHooksConfigFromSnapshot').mockReturnValue({}),
+  )
   savedHooks = getRegisteredHooks()
   clearRegisteredHooks()
 })
@@ -24,6 +34,7 @@ afterEach(() => {
     clearRegisteredHooks()
     if (savedHooks) registerHookCallbacks(savedHooks)
   } finally {
+    for (const spy of settingsSpies.splice(0)) spy.mockRestore()
     releaseSharedMutationLock()
   }
 })
